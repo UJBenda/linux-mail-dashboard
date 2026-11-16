@@ -56,13 +56,17 @@ var/               běhová data (certifikáty AD, zámky) – není v gitu
 
 ## Licence
 
-[MIT s doložkou Commons Clause](LICENSE). Zjednodušeně (závazné je znění v souboru `LICENSE`):
+Copyright (C) 2026 UJBenda
 
-- **Smíte:** používat zdarma, i ve firmě pro vlastní mail server; upravovat; šířit původní i upravené verze.
-- **Musíte:** zachovat informaci o autorovi a text licence (včetně doložky Commons Clause) ve všech kopiích
-  a odvozených dílech.
-- **Nesmíte:** software prodávat – ani jako produkt, ani jako placený hosting nebo placenou podporu,
-  jejichž hodnota stojí hlavně na tomto softwaru.
+Tento program je svobodný software: můžete jej šířit a upravovat podle podmínek
+[GNU General Public License](LICENSE) vydané Free Software Foundation, a to buď verze 3, nebo
+(podle vaší volby) kterékoli pozdější verze (`GPL-3.0-or-later`).
 
-Kvůli zákazu prodeje nejde o open source licenci podle definice OSI, ale o licenci se zveřejněným zdrojovým
-kódem (*source-available*).
+Zjednodušeně (závazné je znění v souboru `LICENSE`):
+
+- **Smíte:** používat zdarma (i ve firmě), upravovat, šířit, i za úplatu.
+- **Musíte:** při šíření (původní i upravené verze) zachovat informaci o autorovi a licenci,
+  zpřístupnit úplný zdrojový kód včetně svých úprav a šířit ho pod stejnou licencí GPL.
+- **Nesmíte:** z programu ani z jeho úprav udělat uzavřený software.
+
+Program je poskytován BEZ JAKÉKOLI ZÁRUKY.

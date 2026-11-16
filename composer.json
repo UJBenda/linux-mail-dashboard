@@ -2,7 +2,7 @@
     "name": "ujbenda/linux-mail-dashboard",
     "description": "Dohledový a administrační panel pro iRedMail (Postfix, Dovecot, Amavis) s přihlášením přes Active Directory",
     "type": "project",
-    "license": "LicenseRef-MIT-Commons-Clause-1.0",
+    "license": "GPL-3.0-or-later",
     "require": {
         "php": ">=8.3",
         "ext-pdo": "*",
