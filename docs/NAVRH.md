@@ -2,7 +2,7 @@
 
 > Stav: **návrh** (rozpracování konceptu z Gemini, s opravami)
 > Prostředí: Ubuntu, iRedMail (free) – Postfix, Dovecot, Amavis, SpamAssassin, ClamAV, iRedAPD, Nginx
-> Panel: Nginx + PHP-FPM 8.3+, PostgreSQL, přihlášení přes AD (kód převzatý ze SMS brány)
+> Panel: Nginx + PHP-FPM 8.3+, PostgreSQL, přihlášení přes Active Directory
 > Schéma DB: [db/migrations/001_init.sql](../db/migrations/001_init.sql) (ověřeno na PostgreSQL 16)
 
 ---
@@ -19,7 +19,7 @@
 | 6 | Karanténa Amavisu: přehled, náhled hlaviček, uvolnění, smazání | 1 (čtení) / 2 (akce) |
 | 7 | Schránky: velikost, kvóta, poslední přihlášení, stav v AD, **opuštěné schránky** | 1 |
 | 8 | Bezpečnost: neúspěšná přihlášení, brute force, podezření na kompromitovaný účet (rozesílá spam) | 2 |
-| 9 | Upozornění přes **SMS bránu** (`POST /api/v1/messages`) a e-mailem | 2 |
+| 9 | Upozornění: e-mail přes externí SMTP a obecný **webhook** (SMS brána, Teams, Slack, ntfy…) | 2 |
 | 10 | Kontroly: RBL listování vlastní IP, expirace certifikátů, SPF/DKIM/DMARC, disk | 2 |
 | 11 | (volitelně) Správa domén, schránek, aliasů – náhrada iRedAdmin | 3 |
 
@@ -100,9 +100,8 @@ Agregace pak přežijí i smazání surových dat po retenci.
 
 ### 2.7 PHP 8.5
 
-Nic z návrhu PHP 8.5 nepotřebuje. Ubuntu 24.04 má v balíčcích **8.3**, SMS brána cílí na 8.2+. Doporučuji
-8.3 z distribuce (bezpečnostní updaty bez PPA) – a hlavně kvůli sdílení kódu se SMS bránou.
-8.5 přes PPA `ondrej/php` jde, ale není důvod.
+Nic z návrhu PHP 8.5 nepotřebuje. Ubuntu 24.04 má v balíčcích **8.3** – doporučuji ji (bezpečnostní updaty
+z distribuce bez PPA). 8.5 přes PPA `ondrej/php` jde, ale není důvod.
 
 ### 2.8 Opuštěné schránky
 
@@ -111,7 +110,7 @@ Pohled z Gemini je v pořádku jako nápad, vylepšení v [001_init.sql](../db/m
 - prahy (dny, MB) jako parametry – nastavitelné v portálu,
 - „poslední přihlášení“ = max z IMAP, POP3 a **SMTP SASL** (kdo jen odesílá z telefonu, není opuštěný),
 - AD stav nejen `ACCOUNTDISABLE` v `userAccountControl`, ale i `accountExpires` a **účet v AD neexistuje** –
-  to už umí `AdClient::accountStatus()` ze SMS brány,
+  (bit `ACCOUNTDISABLE` v `userAccountControl`, `accountExpires`, účet nenalezen),
 - sloupec `reason` – proč je schránka v seznamu.
 
 ---
@@ -139,7 +138,7 @@ Pohled z Gemini je v pořádku jako nápad, vylepšení v [001_init.sql](../db/m
                        │     fronta, služby, used_quota+last_login → mailbox_stats, AD sync, RBL      │
                        │            │                                                                 │
                        └────────────┼─────────────────────────────────────────────────────────────────┘
-                                    └──► SMS brána  POST /api/v1/messages  (upozornění)
+                                    └──► upozornění: webhook (HTTP POST) / e-mail přes externí SMTP
 ```
 
 ### 3.1 Komponenty
@@ -151,7 +150,7 @@ Pohled z Gemini je v pořádku jako nápad, vylepšení v [001_init.sql](../db/m
 | **sampler** | `mailpanel` | `postqueue -j`, `systemctl is-active`, DNS | vzorky fronty, health, sync schránek |
 | **agent** | root | jen whitelist akcí; DB `mailpanel_agent` | akce nad frontou, karanténou, Dovecotem |
 
-Collector, sampler i agent jsou CLI příkazy jednoho binárního vstupu `bin/mailpanel` (jako `bin/smsgw`):
+Collector, sampler i agent jsou CLI příkazy jednoho vstupního skriptu `bin/mailpanel`:
 `bin/mailpanel collect`, `bin/mailpanel sample --every=1m`, `bin/mailpanel agent`, `bin/mailpanel migrate`,
 `bin/mailpanel check`, `bin/mailpanel admin:local`, `bin/mailpanel login:unlock`.
 
@@ -168,21 +167,26 @@ Collector, sampler i agent jsou CLI příkazy jednoho binárního vstupu `bin/ma
 Alternativa pro větší prostředí: panel na samostatné VM, na mail serveru jen collector+agent zapisující do
 vzdáleného PG. Návrh to umožňuje beze změny (všechno jde přes DB), ale pro jeden server je to zbytečné.
 
-### 3.3 Sdílení kódu se SMS bránou
+### 3.3 Technologie
 
-Ze SMS brány (samostatný projekt, PHP bez frameworku) se převezme téměř beze změny:
+- **PHP 8.3+ bez frameworku**, Composer jen pro autoload (žádné runtime závislosti) – méně aktualizací,
+  menší plocha pro útok, snadný audit kódu.
+- Vlastní tenká web vrstva: router, request/response, session, CSRF, šablony v čistém PHP s escapováním.
+- `ext-ldap` pro AD, `ext-pdo_pgsql` pro DB, `ext-sodium` pro šifrování tajných hodnot v DB.
+- Frontend: vlastní CSS + vanilla JS, **Chart.js** uložený lokálně (žádné CDN – panel běží ve vnitřní síti).
 
-| SMS brána | Použití v mail panelu | Úprava |
-|-----------|-----------------------|--------|
-| `src/Ad/AdClient.php`, `AdDiagnostics.php`, `CertificateStore.php` | přihlášení, test AD, import CA, sync stavu schránek | žádná |
-| `src/Auth/Authenticator.php` | login, throttling, nouzový účet | role z `Roles` mail panelu |
-| `src/Web/Kernel.php`, `Request`, `Response`, `Session`, `View` | web vrstva, CSRF, session | routy |
-| `src/Support/Crypto`, `Config`, `Audit`, `IpMatcher`, `Settings`, `Migrator` | stejné | SQL pro PG |
-| `templates/admin/ad*.php`, `auth/login.php` | správa AD v portálu | vzhled |
-| `src/Support/Db.php` | DB vrstva | **MySQL → PostgreSQL**: `ON DUPLICATE KEY` → `ON CONFLICT`, `lastInsertId()` → `RETURNING id` |
+### 3.4 Přihlášení přes Active Directory
 
-Doporučení: vytáhnout `Ad/`, `Auth/`, `Web/`, `Support/` do **sdíleného balíčku** (Composer, path/vcs repo),
-ať se oprava AD přihlášení nedělá dvakrát. Rozdíly MySQL/PG schovat do `Db::upsert()`.
+- LDAPS (636) nebo StartTLS (389), více řadičů domény s pořadím (fallback), vlastní CA certifikát
+  nahraný přes portál,
+- servisní účet jen pro vyhledání uživatele (`sAMAccountName` nebo UPN), pak **bind jako uživatel**
+  s jeho heslem; heslo se nikam neukládá,
+- kontrola stavu účtu (zakázaný, vypršelý, uzamčený),
+- skupiny přes `tokenGroups` (včetně vnořených skupin) → **role podle SID skupin** (přejmenování skupiny
+  nic nerozbije); role se obnovují při každém přihlášení,
+- omezení pokusů na uživatele i IP, audit každého přihlášení,
+- **nouzový lokální účet** (CLI `bin/mailpanel admin:local`) jen z povolených IP – pro výpadek AD,
+- diagnostika v portálu: test spojení na každý řadič, ověření certifikátu, test přihlášení uživatele.
 
 ---
 
@@ -348,7 +352,7 @@ spoolu jako `postfix`, `doveadm` přes socket Dovecotu.)
   vlastní IP, aktivní upozornění.
 - **Top 10:** odesílatelé ven, domény příjemců s chybami, IP s nejvíc odmítnutími.
 
-Knihovna grafů: **Chart.js** (lokálně v `public/assets`, žádná CDN – stejně jako SMS brána).
+Knihovna grafů: **Chart.js** (lokálně v `public/assets`, žádná CDN).
 Data přes JSON endpointy z `stats_hourly`, odpověď v řádu ms.
 
 ### 6.2 Hledání zpráv (trasování)
@@ -404,7 +408,7 @@ lokální resolver (iRedMail ho kvůli postscreenu stejně potřebuje).
 
 ### 6.8 Administrace
 
-Jako SMS brána: AD servery, CA certifikát, skupiny → role, test přihlášení, diagnostika; nastavení prahů
+AD servery, CA certifikát, skupiny → role, test přihlášení, diagnostika; nastavení prahů
 (upozornění, opuštěné schránky, retence); auditní log.
 
 ---
@@ -418,19 +422,19 @@ Jako SMS brána: AD servery, CA certifikát, skupiny → role, test přihlášen
 | `operator` | navíc akce nad frontou a karanténou (hromadně) |
 | `admin` | vše: nastavení, AD, role, tělo zpráv ve frontě/karanténě, `mailbox.kick` |
 
-Role se přidělují skupinami AD (stejný mechanismus jako SMS brána – SID skupin, `tokenGroups`, obnova při
+Role se přidělují skupinami AD (viz 3.4 – SID skupin, `tokenGroups`, obnova při
 každém přihlášení). Nouzový lokální účet jen z povolených IP.
 
 ---
 
 ## 8. Bezpečnost a GDPR
 
-- panel jen z vnitřní sítě (Nginx `allow/deny`), HTTPS, `cookie_secure`, CSRF, session limity – jako SMS brána,
+- panel jen z vnitřní sítě (Nginx `allow/deny`), HTTPS, `cookie_secure`, CSRF, session limity (nečinnost, maximální délka),
 - logy pošty jsou **osobní údaje** (kdo komu píše). Retence omezená (kap. 4.4), přístup podle rolí,
   **každé hledání se zapisuje do auditu** (kdo hledal čí poštu),
 - předmět a tělo zprávy: předmět jen pro `helpdesk`+, tělo jen `admin` s auditem,
 - read-only účet do iRedMail DB bez přístupu ke sloupci `password` (`GRANT SELECT (sloupce…)`),
-- tajné hodnoty (heslo servisního účtu AD, token SMS brány) šifrované v DB (`Crypto` ze SMS brány),
+- tajné hodnoty (heslo servisního účtu AD, tokeny webhooků) šifrované v DB (libsodium),
 - `config.php` mimo webroot, `root:mailpanel 0640`.
 
 ---
@@ -440,33 +444,38 @@ každém přihlášení). Nouzový lokální účet jen z povolených IP.
 Sampler každou minutu vyhodnotí pravidla a stav uloží do `alert_state` (změna stavu = notifikace,
 ne každou minutu znovu):
 
-| Pravidlo | Výchozí práh | Priorita SMS |
-|----------|--------------|--------------|
-| služba postfix/dovecot/amavis neběží | 2 min | P1 |
-| fronta deferred | > 500 zpráv | P2 |
-| nejstarší zpráva ve frontě | > 4 h | P3 |
-| vlastní IP na RBL | ihned | P2 |
-| podezření na kompromitovaný účet | viz 6.7 | P1 |
-| collector neběží / log stojí | 10 min | P3 |
-| certifikát expiruje | < 14 dní | P4 |
-| disk `/var/vmail` | > 85 % / > 95 % | P3 / P2 |
+| Pravidlo | Výchozí práh | Závažnost |
+|----------|--------------|-----------|
+| služba postfix/dovecot/amavis neběží | 2 min | critical |
+| fronta deferred | > 500 zpráv | warning |
+| nejstarší zpráva ve frontě | > 4 h | warning |
+| vlastní IP na RBL | ihned | critical |
+| podezření na kompromitovaný účet | viz 6.7 | critical |
+| collector neběží / log stojí | 10 min | warning |
+| certifikát expiruje | < 14 dní | warning |
+| disk `/var/vmail` | > 85 % / > 95 % | warning / critical |
 
-Odeslání na SMS bránu:
+Kanály (nastavují se v portálu, každé pravidlo může jít jiným kanálem podle závažnosti):
 
-```http
-POST /sms/api/v1/messages
-Authorization: Bearer <token klienta „mailpanel“>
-{"text": "MAIL: fronta deferred 812 (top: seznam.cz connection timed out)", "priority": 2, "recipient": "oncall"}
-```
+- **Webhook** – obecný HTTP POST s JSON tělem, volitelnou hlavičkou `Authorization` a šablonou těla.
+  Napojí se tak libovolná SMS brána, MS Teams, Slack, ntfy, Zabbix… bez úprav kódu:
 
-`recipient: oncall` → jde na aktuálně sloužícího podle rozpisu služeb v SMS bráně. Při výpadku
-e-mailu je SMS jediný kanál, který funguje – proto ne upozornění e-mailem přes ten samý server.
+  ```json
+  {"source": "linux-mail-dashboard", "host": "mail1", "key": "queue.deferred",
+   "severity": "warning", "status": "problem",
+   "text": "Fronta deferred 812 (top: example.com connection timed out)"}
+  ```
+
+- **E-mail** – přes **externí** SMTP server (relay), ne přes vlastní Postfix: když stojí pošta,
+  upozornění poslané tou samou poštou nedorazí.
+
+Kanál pro závažnost `critical` by neměl záviset na funkčnosti mail serveru (webhook na SMS/chat).
 
 ---
 
 ## 10. Struktura projektu
 
-Tento repozitář, stejná struktura jako SMS brána:
+Tento repozitář:
 
 ```
 bin/mailpanel          CLI: migrate, collect, sample, agent, check, admin:local, login:unlock, import
@@ -475,13 +484,16 @@ db/migrations/         001_init.sql
 deploy/                nginx vhost, php-fpm pool, systemd: collector, agent, sampler.timer
 public/                index.php, assets (Chart.js lokálně)
 src/
-  Ad/ Auth/ Web/ Support/        ← sdílené se SMS bránou
+  Ad/         AdClient, AdDiagnostics, CertificateStore
+  Auth/       Authenticator, Roles
+  Web/        Kernel, Router, Request, Response, Session, View
+  Support/    Db, Config, Crypto, Settings, Audit, Migrator
   Collector/  LogReader, PostfixParser, DovecotParser, AmavisParser, Correlator, StatsWriter
   Queue/      PostqueueReader (proudově), QueueService
   Quarantine/ AmavisRepository, ReleaseClient (AM.PDP)
   Mailbox/    MailboxSync (used_quota, last_login, AD)
   Agent/      Agent, TaskValidator, Actions/*
-  Alert/      Rules, SmsGatewayClient
+  Alert/      Rules, Channels/Webhook, Channels/Email
   Web/Controller/  Dashboard, Trace, Logs, Queue, Quarantine, Mailboxes, Security, Admin/*
 templates/
 tests/                 parsery logů testované na reálných (anonymizovaných) řádcích
@@ -493,12 +505,12 @@ tests/                 parsery logů testované na reálných (anonymizovaných)
 
 | Krok | Obsah | Výsledek |
 |------|-------|----------|
-| 1 | Kostra: sdílené `Ad/Auth/Web/Support`, port `Db` na PostgreSQL, login přes AD, role, audit | přihlášení funguje |
+| 1 | Kostra: web vrstva, DB (PostgreSQL), migrace, login přes AD, role, audit, CLI | přihlášení funguje |
 | 2 | Collector: čtení souborů s offsetem, parser Postfixu + Amavisu, korelace, `stats_hourly`, import historie | data v DB |
 | 3 | Dashboard + grafy, Logy, Trasování | **použitelné pro helpdesk** |
 | 4 | Sampler: fronta, služby, schránky (used_quota, last_login), AD sync; obrazovky Fronta, Schránky, Karanténa (čtení) | celý přehled |
 | 5 | Agent + akce (fronta, karanténa) | správa |
-| 6 | Upozornění přes SMS bránu, bezpečnostní přehled, RBL/cert/DNS kontroly | dohled |
+| 6 | Upozornění (webhook, e-mail), bezpečnostní přehled, RBL/cert/DNS kontroly | dohled |
 | 7 | (volitelně) správa domén/schránek/aliasů | náhrada iRedAdmin |
 
 Parsery jsou nejrizikovější část – začít sbírkou reálných řádků ze serveru (`grep` vzorky každého typu)

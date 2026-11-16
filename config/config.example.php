@@ -32,7 +32,7 @@ return [
         ],
     ],
 
-    // Klíč pro šifrování tajných hodnot v DB (servisní účet AD, token SMS brány).
+    // Klíč pro šifrování tajných hodnot v DB (servisní účet AD, tokeny webhooků).
     // Vygenerujte: bin/mailpanel key:generate
     'secret_key' => '',
 

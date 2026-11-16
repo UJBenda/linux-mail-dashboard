@@ -15,7 +15,7 @@ Vlastní dohledový a administrační panel pro mail server postavený na **iRed
 - **Karanténa Amavisu:** přehled, náhled, uvolnění.
 - **Schránky:** velikost, kvóta, poslední přihlášení, stav v AD, opuštěné schránky.
 - **Bezpečnost:** brute force, podezření na kompromitovaný účet, vlastní IP na RBL.
-- **Upozornění** přes SMS bránu (API) a e-mailem.
+- **Upozornění** přes webhook (SMS brána, Teams, Slack, ntfy…) a e-mail přes externí SMTP.
 
 ## Architektura v kostce
 

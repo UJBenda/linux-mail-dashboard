@@ -14,7 +14,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ---------------------------------------------------------------------
--- 1. Přihlášení, role, nastavení, audit (port ze SMS brány)
+-- 1. Přihlášení, role, nastavení, audit
 -- ---------------------------------------------------------------------
 
 CREATE TABLE users (
@@ -361,7 +361,7 @@ CREATE TRIGGER agent_task_notify AFTER INSERT ON agent_task
     FOR EACH ROW EXECUTE FUNCTION agent_task_notify();
 
 -- ---------------------------------------------------------------------
--- 6. Upozornění (SMS brána, e-mail)
+-- 6. Upozornění (webhook, e-mail)
 -- ---------------------------------------------------------------------
 
 CREATE TABLE alert_state (
