@@ -1,6 +1,7 @@
 # Linux Mail Dashboard – návrh dohledového a administračního panelu pro iRedMail
 
-> Stav: **návrh** (rozpracování konceptu z Gemini, s opravami)
+> Stav: **krok 1 hotový** (přihlášení přes AD + MFA, role, audit s ochranou integrity), další kroky viz kap. 11
+> Účel: hledání provozních problémů **a detekce a vyšetřování útoků**; požadavky NIS2 viz [NIS2.md](NIS2.md)
 > Prostředí: Ubuntu, iRedMail (free) – Postfix, Dovecot, Amavis, SpamAssassin, ClamAV, iRedAPD, Nginx
 > Panel: Nginx + PHP-FPM 8.3+, PostgreSQL, přihlášení přes Active Directory
 > Schéma DB: [db/migrations/001_init.sql](../db/migrations/001_init.sql) (ověřeno na PostgreSQL 16)
@@ -11,14 +12,14 @@
 
 | # | Co | Fáze |
 |---|----|------|
-| 1 | Přihlášení přes AD (LDAPS/StartTLS), role podle skupin AD, nouzový lokální účet, audit | 1 |
+| 1 | Přihlášení přes AD (LDAPS/StartTLS) + **povinné MFA (TOTP)**, role podle skupin AD, nouzový lokální účet, audit s ochranou integrity | 1 |
 | 2 | Dashboard: provoz in/out, odmítnuté, spam/viry, fronta, stav služeb, grafy | 1 |
 | 3 | Logy v PostgreSQL: hledání, filtry, fulltext, živé sledování | 1 |
 | 4 | **Trasování zprávy** – celá cesta zprávy (příjem → Amavis → doručení) na jedné stránce | 1 |
 | 5 | Fronta Postfixu: přehled, filtry, důvody odkladu, graf v čase | 1 (čtení) / 2 (akce) |
 | 6 | Karanténa Amavisu: přehled, náhled hlaviček, uvolnění, smazání | 1 (čtení) / 2 (akce) |
 | 7 | Schránky: velikost, kvóta, poslední přihlášení, stav v AD, **opuštěné schránky** | 1 |
-| 8 | Bezpečnost: neúspěšná přihlášení, brute force, podezření na kompromitovaný účet (rozesílá spam) | 2 |
+| 8 | Bezpečnost a **hledání útoků**: brute force, password spraying, kompromitovaný účet, pivot podle IP/účtu, časová osa | 2 |
 | 9 | Upozornění: e-mail přes externí SMTP a obecný **webhook** (SMS brána, Teams, Slack, ntfy…) | 2 |
 | 10 | Kontroly: RBL listování vlastní IP, expirace certifikátů, SPF/DKIM/DMARC, disk | 2 |
 | 11 | (volitelně) Správa domén, schránek, aliasů – náhrada iRedAdmin | 3 |
@@ -152,7 +153,7 @@ Pohled z Gemini je v pořádku jako nápad, vylepšení v [001_init.sql](../db/m
 
 Collector, sampler i agent jsou CLI příkazy jednoho vstupního skriptu `bin/mailpanel`:
 `bin/mailpanel collect`, `bin/mailpanel sample --every=1m`, `bin/mailpanel agent`, `bin/mailpanel migrate`,
-`bin/mailpanel check`, `bin/mailpanel admin:local`, `bin/mailpanel login:unlock`.
+`bin/mailpanel check`, `bin/mailpanel user:local`, `bin/mailpanel login:unlock`.
 
 ### 3.2 Kde panel běží
 
@@ -185,8 +186,13 @@ vzdáleného PG. Návrh to umožňuje beze změny (všechno jde přes DB), ale p
 - skupiny přes `tokenGroups` (včetně vnořených skupin) → **role podle SID skupin** (přejmenování skupiny
   nic nerozbije); role se obnovují při každém přihlášení,
 - omezení pokusů na uživatele i IP, audit každého přihlášení,
-- **nouzový lokální účet** (CLI `bin/mailpanel admin:local`) jen z povolených IP – pro výpadek AD,
-- diagnostika v portálu: test spojení na každý řadič, ověření certifikátu, test přihlášení uživatele.
+- **druhý faktor (TOTP) povinný pro všechny účty** – NIS2 vyžaduje vícefaktorovou autentizaci
+  privilegovaných přístupů; kód lze použít jen jednou,
+- **nouzový lokální účet** (CLI `bin/mailpanel user:local`) jen z povolených IP – pro výpadek AD, také s MFA,
+- nastavení AD je v `config.php` (root:mailpanel 0640), ne v DB – změny konfigurace podléhají změnovému
+  řízení a útočník s přístupem do portálu nemůže přesměrovat ověřování na vlastní server,
+- diagnostika z CLI: `bin/mailpanel ad:test [jméno]` (spojení, certifikát, přihlášení, role),
+  `ad:groups` (SID skupin), `check`.
 
 ---
 
@@ -271,11 +277,17 @@ Orientačně: 10 000 zpráv/den ≈ 150 000 řádků logu/den ≈ 50–80 MB/den
 
 | Data | Retence (výchozí, nastavitelné) |
 |------|---------------------------------|
-| `log_line` (surové) | 3 měsíce |
-| `mail_message`, `mail_delivery`, `mail_reject` | 6 měsíců |
-| `auth_event` | 6 měsíců |
+| `log_line` (surové) | 18 měsíců |
+| `mail_reject`, `auth_event` (bezpečnostní události) | 18 měsíců |
+| `mail_message`, `mail_delivery` | 18 měsíců |
 | `stats_hourly`, `queue_sample` (agregace) | natrvalo / `queue_sample` 1 rok |
-| `audit_log` | 2 roky |
+| `audit_log` (činnost v panelu) | 2 roky |
+
+Výchozí 18 měsíců vychází z požadavků na uchovávání bezpečnostních záznamů – konkrétní lhůtu pro váš
+režim ověřte ve vyhlášce NÚKIB (viz [NIS2.md](NIS2.md)). Proti tomu stojí minimalizace osobních údajů
+(GDPR) – proto jsou lhůty nastavitelné po tabulkách. Při 10 000 zprávách/den počítejte s ~30–45 GB
+pro 18 měsíců surových logů; pokud je to moc, zkraťte retenci `log_line` a nechte delší retenci
+strukturovaných bezpečnostních tabulek.
 
 Měsíční partitions (`ensure_partitions()`, `drop_old_partitions()` ve schématu) – mazání starých dat je
 `DROP TABLE` jedné partition, okamžité a bez bloatu.
@@ -408,7 +420,7 @@ lokální resolver (iRedMail ho kvůli postscreenu stejně potřebuje).
 
 ### 6.8 Administrace
 
-AD servery, CA certifikát, skupiny → role, test přihlášení, diagnostika; nastavení prahů
+Uživatelé panelu (role, MFA, zakázání), auditní záznam s ověřením integrity a exportem; nastavení prahů
 (upozornění, opuštěné schránky, retence); auditní log.
 
 ---
@@ -417,17 +429,23 @@ AD servery, CA certifikát, skupiny → role, test přihlášení, diagnostika; 
 
 | Role | Co smí |
 |------|--------|
-| `auditor` | jen čtení: dashboard, statistiky, audit; v trasování **bez předmětů** |
-| `helpdesk` | trasování zpráv, logy, schránky (čtení), karanténa – uvolnit zprávu jen pro jednoho příjemce |
-| `operator` | navíc akce nad frontou a karanténou (hromadně) |
-| `admin` | vše: nastavení, AD, role, tělo zpráv ve frontě/karanténě, `mailbox.kick` |
+| `auditor` | jen čtení: dashboard, statistiky, audit; **bez předmětů** zpráv |
+| `helpdesk` | trasování zpráv, schránky (čtení), karanténa – uvolnit zprávu jednomu příjemci |
+| `operator` | logy, trasování, akce nad frontou a karanténou (hromadně) |
+| `security` | bezpečnostní analytik: logy, bezpečnostní přehled, hledání útoků, audit – **bez zásahů do pošty** |
+| `admin` | vše: uživatelé panelu, nastavení, tělo zpráv ve frontě/karanténě, `mailbox.kick` |
+
+Oprávnění jsou pevně v kódu (`src/Auth/Roles.php`) – role nejde v portálu „rozšířit“.
 
 Role se přidělují skupinami AD (viz 3.4 – SID skupin, `tokenGroups`, obnova při
 každém přihlášení). Nouzový lokální účet jen z povolených IP.
 
 ---
 
-## 8. Bezpečnost a GDPR
+## 8. Bezpečnost, NIS2 a GDPR
+
+Mapování na požadavky NIS2 je v [NIS2.md](NIS2.md). Shrnutí:
+
 
 - panel jen z vnitřní sítě (Nginx `allow/deny`), HTTPS, `cookie_secure`, CSRF, session limity (nečinnost, maximální délka),
 - logy pošty jsou **osobní údaje** (kdo komu píše). Retence omezená (kap. 4.4), přístup podle rolí,
@@ -435,7 +453,9 @@ každém přihlášení). Nouzový lokální účet jen z povolených IP.
 - předmět a tělo zprávy: předmět jen pro `helpdesk`+, tělo jen `admin` s auditem,
 - read-only účet do iRedMail DB bez přístupu ke sloupci `password` (`GRANT SELECT (sloupce…)`),
 - tajné hodnoty (heslo servisního účtu AD, tokeny webhooků) šifrované v DB (libsodium),
-- `config.php` mimo webroot, `root:mailpanel 0640`.
+- `config.php` mimo webroot, `root:mailpanel 0640`,
+- auditní záznam chráněný hash chainem, hlava řetězu každou hodinu do syslogu → centrální log/SIEM,
+- logy pošty se kopírují i na centrální log server – při kompromitaci mail serveru zůstanou jinde.
 
 ---
 
@@ -478,7 +498,7 @@ Kanál pro závažnost `critical` by neměl záviset na funkčnosti mail serveru
 Tento repozitář:
 
 ```
-bin/mailpanel          CLI: migrate, collect, sample, agent, check, admin:local, login:unlock, import
+bin/mailpanel          CLI: migrate, collect, sample, agent, check, user:local, login:unlock, import
 config/                config.php (DB, iRedMail DB DSN, zdroje logů) – není v gitu
 db/migrations/         001_init.sql
 deploy/                nginx vhost, php-fpm pool, systemd: collector, agent, sampler.timer
@@ -505,12 +525,12 @@ tests/                 parsery logů testované na reálných (anonymizovaných)
 
 | Krok | Obsah | Výsledek |
 |------|-------|----------|
-| 1 | Kostra: web vrstva, DB (PostgreSQL), migrace, login přes AD, role, audit, CLI | přihlášení funguje |
+| 1 ✅ | Kostra: web vrstva, DB (PostgreSQL), migrace, login přes AD + MFA, role, audit s hash chainem, CLI, testy, CI | přihlášení funguje |
 | 2 | Collector: čtení souborů s offsetem, parser Postfixu + Amavisu, korelace, `stats_hourly`, import historie | data v DB |
 | 3 | Dashboard + grafy, Logy, Trasování | **použitelné pro helpdesk** |
 | 4 | Sampler: fronta, služby, schránky (used_quota, last_login), AD sync; obrazovky Fronta, Schránky, Karanténa (čtení) | celý přehled |
 | 5 | Agent + akce (fronta, karanténa) | správa |
-| 6 | Upozornění (webhook, e-mail), bezpečnostní přehled, RBL/cert/DNS kontroly | dohled |
+| 6 | Upozornění (webhook, e-mail, syslog pro SIEM), detekční pravidla, hledání útoků (pivot IP/účet, časová osa), RBL/cert/DNS kontroly | dohled a bezpečnost |
 | 7 | (volitelně) správa domén/schránek/aliasů | náhrada iRedAdmin |
 
 Parsery jsou nejrizikovější část – začít sbírkou reálných řádků ze serveru (`grep` vzorky každého typu)

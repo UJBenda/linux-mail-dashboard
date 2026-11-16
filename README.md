@@ -3,18 +3,24 @@
 Vlastní dohledový a administrační panel pro mail server postavený na **iRedMail**
 (Postfix, Dovecot, Amavis, SpamAssassin, ClamAV, iRedAPD) na Ubuntu.
 
-> Stav: **návrh** – viz [docs/NAVRH.md](docs/NAVRH.md). Kód zatím není.
+Slouží k hledání provozních problémů pošty **a k detekci a vyšetřování útoků**; navržen s ohledem
+na požadavky **NIS2** (zákon č. 264/2025 Sb.) – viz [docs/NIS2.md](docs/NIS2.md).
+
+> Stav: **krok 1 hotový** – přihlášení přes AD s povinným MFA, role, auditní záznam s ochranou integrity,
+> CLI, testy. Data o poště (logy, fronta, statistiky) přibudou v dalších krocích – viz [docs/NAVRH.md](docs/NAVRH.md).
 
 ## Co bude umět
 
-- **Přihlášení přes Active Directory** (LDAPS / StartTLS), role podle skupin AD, nouzový lokální účet, audit.
+- **Přihlášení přes Active Directory** (LDAPS / StartTLS) s **povinným dvoufázovým ověřením (TOTP)**, role podle
+  skupin AD, nouzový lokální účet, auditní záznam chráněný proti změnám (hash chain).
 - **Dashboard:** provoz in/out, odmítnuté zprávy, spam a viry, fronta, stav služeb, grafy (Chart.js).
 - **Logy v PostgreSQL:** hledání, filtry, fulltext, živé sledování.
 - **Trasování zprávy:** celá cesta zprávy (příjem → Amavis → doručení) na jedné stránce.
 - **Fronta Postfixu:** přehled, důvody odkladu, graf v čase, akce (hold, release, requeue, delete).
 - **Karanténa Amavisu:** přehled, náhled, uvolnění.
 - **Schránky:** velikost, kvóta, poslední přihlášení, stav v AD, opuštěné schránky.
-- **Bezpečnost:** brute force, podezření na kompromitovaný účet, vlastní IP na RBL.
+- **Bezpečnost a hledání útoků:** brute force, password spraying, kompromitovaný účet, pivot podle IP a účtu,
+  časová osa, vlastní IP na RBL.
 - **Upozornění** přes webhook (SMS brána, Teams, Slack, ntfy…) a e-mail přes externí SMTP.
 
 ## Architektura v kostce
@@ -22,7 +28,7 @@ Vlastní dohledový a administrační panel pro mail server postavený na **iRed
 | Komponenta | Úkol |
 |------------|------|
 | web (Nginx + PHP-FPM 8.3+) | portál; data jen čte, akce zapisuje jako úkoly do DB |
-| collector (systemd) | čte logy, páruje záznamy podle Queue-ID, plní PostgreSQL a hodinové statistiky |
+| collector (systemd) | čte logy, páruje záznamy podle Queue-ID, plní PostgreSQL (jen zápis) a hodinové statistiky |
 | sampler (systemd timer) | vzorky fronty, stav služeb, synchronizace schránek a stavu v AD |
 | agent (systemd, root) | provádí jen povolené akce (`postsuper`, `doveadm`, …) z tabulky úkolů – žádné sudo pro web |
 
@@ -53,6 +59,24 @@ var/               běhová data (certifikáty AD, zámky) – není v gitu
 ## Dokumentace
 
 - [Návrh řešení](docs/NAVRH.md)
+- [Instalace](docs/INSTALACE.md)
+- [NIS2 – mapování požadavků](docs/NIS2.md)
+- [Hlášení zranitelností](SECURITY.md)
+
+## Vývoj
+
+```bash
+php tests/run.php
+```
+
+Lokální spuštění (vestavěný server PHP, jen pro vývoj):
+
+```bash
+MAILPANEL_CONFIG=/cesta/k/config.php php -S 127.0.0.1:8080 -t public tests/dev-router.php
+```
+
+Knihovny třetích stran: [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) 1.4.4
+(Kazuhiko Arase, MIT) v `public/assets/vendor/`.
 
 ## Licence
 

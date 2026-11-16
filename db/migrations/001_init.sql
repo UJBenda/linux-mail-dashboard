@@ -14,67 +14,137 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ---------------------------------------------------------------------
--- 1. Přihlášení, role, nastavení, audit
+-- 1. Uživatelé, MFA, nastavení, audit
 -- ---------------------------------------------------------------------
 
 CREATE TABLE users (
-    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    username       text NOT NULL UNIQUE,              -- lower(sAMAccountName) / lokální
-    display_name   text NOT NULL DEFAULT '',
-    email          text,
-    source         text NOT NULL CHECK (source IN ('ad', 'local')),
-    password_hash  text,                               -- jen 'local'
-    allowed_ips    text,                               -- jen 'local', CIDR seznam
-    roles          text NOT NULL DEFAULT '',           -- 'admin,operator' – obnovuje se z AD při loginu
-    is_active      boolean NOT NULL DEFAULT true,
-    last_login_at  timestamptz,
-    created_at     timestamptz NOT NULL DEFAULT now()
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username         text NOT NULL UNIQUE,              -- lower(sAMAccountName) / lokální jméno
+    display_name     text NOT NULL DEFAULT '',
+    email            text,
+    source           text NOT NULL CHECK (source IN ('ad', 'local')),
+    ad_dn            text,
+    password_hash    text,                               -- jen 'local' (Argon2id / bcrypt)
+    allowed_ips      text,                               -- jen 'local': CIDR seznam oddělený čárkou
+    roles            text NOT NULL DEFAULT '',           -- 'admin,security' – u AD se obnovuje při každém loginu
+    is_active        boolean NOT NULL DEFAULT true,
+    totp_secret      text,                               -- šifrováno (libsodium secretbox), NULL = MFA nenastaveno
+    totp_last_step   bigint,                             -- ochrana proti opakovanému použití kódu
+    mfa_enrolled_at  timestamptz,
+    last_login_at    timestamptz,
+    last_login_ip    inet,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT users_local_hash CHECK (source <> 'local' OR password_hash IS NOT NULL)
 );
 
 CREATE TABLE login_attempts (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     username    text NOT NULL,
     ip          inet NOT NULL,
+    stage       text NOT NULL DEFAULT 'password' CHECK (stage IN ('password', 'mfa')),
     success     boolean NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX login_attempts_user_idx ON login_attempts (username, created_at);
 CREATE INDEX login_attempts_ip_idx   ON login_attempts (ip, created_at);
 
-CREATE TABLE ad_servers (
-    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    host       text NOT NULL,
-    port       int  NOT NULL DEFAULT 636,
-    mode       text NOT NULL DEFAULT 'ldaps' CHECK (mode IN ('ldaps', 'starttls')),
-    position   int  NOT NULL DEFAULT 0,
-    is_active  boolean NOT NULL DEFAULT true
-);
-
-CREATE TABLE ad_role_groups (
-    role        text NOT NULL,
-    group_sid   text NOT NULL,
-    group_dn    text NOT NULL,
-    group_name  text NOT NULL,
-    PRIMARY KEY (role, group_sid)
+-- Odemčení po zablokování: pokusy starší než tento čas se nepočítají.
+CREATE TABLE login_unlock (
+    subject     text PRIMARY KEY,                       -- 'user:jnovak' / 'ip:10.0.0.5'
+    unlocked_at timestamptz NOT NULL DEFAULT now(),
+    unlocked_by text NOT NULL
 );
 
 CREATE TABLE settings (
     name        text PRIMARY KEY,
-    value       text NOT NULL,                         -- tajné hodnoty šifrované (sodium)
+    value       text NOT NULL,                          -- tajné hodnoty šifrované (libsodium)
     updated_at  timestamptz NOT NULL DEFAULT now(),
     updated_by  text
 );
 
+-- Auditní záznam s ochranou integrity (NIS2): každý řádek nese SHA-256 z obsahu
+-- a hashe předchozího řádku (hash chain). Řetěz počítá DB trigger, ne aplikace;
+-- UPDATE/DELETE/TRUNCATE jsou zakázané triggerem. Hlavu řetězu (seq + hash)
+-- pravidelně odesílá `bin/mailpanel audit:anchor` do syslogu → centrální log/SIEM,
+-- takže ani správce DB nemůže historii nepozorovaně přepsat.
 CREATE TABLE audit_log (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    created_at  timestamptz NOT NULL DEFAULT now(),
+    seq         bigint NOT NULL UNIQUE,
+    created_at  timestamptz NOT NULL,
     username    text,
     ip          inet,
-    action      text NOT NULL,                         -- 'queue.delete', 'quarantine.release', 'log.search' …
-    details     jsonb NOT NULL DEFAULT '{}'
+    action      text NOT NULL,                          -- 'auth.login', 'queue.delete', 'log.search' …
+    result      text NOT NULL DEFAULT 'ok' CHECK (result IN ('ok', 'fail', 'denied')),
+    details     jsonb NOT NULL DEFAULT '{}',
+    prev_hash   text NOT NULL,
+    hash        text NOT NULL
 );
 CREATE INDEX audit_log_time_idx   ON audit_log (created_at);
 CREATE INDEX audit_log_action_idx ON audit_log (action, created_at);
+CREATE INDEX audit_log_user_idx   ON audit_log (username, created_at);
+
+CREATE FUNCTION audit_log_payload(p_seq bigint, p_created timestamptz, p_username text, p_ip inet,
+                                  p_action text, p_result text, p_details jsonb, p_prev text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT concat_ws('|', p_prev, p_seq::text,
+                     to_char(p_created AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                     coalesce(p_username, ''), coalesce(host(p_ip), ''),
+                     p_action, p_result, p_details::text)
+$$;
+
+CREATE FUNCTION audit_log_chain() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    last record;
+BEGIN
+    -- serializace zápisů: pořadí v řetězu = pořadí commitů
+    PERFORM pg_advisory_xact_lock(7243501);
+    SELECT seq, hash INTO last FROM audit_log ORDER BY seq DESC LIMIT 1;
+    NEW.seq        := coalesce(last.seq, 0) + 1;
+    NEW.prev_hash  := coalesce(last.hash, repeat('0', 64));
+    NEW.created_at := clock_timestamp();
+    NEW.hash := encode(sha256(convert_to(audit_log_payload(NEW.seq, NEW.created_at, NEW.username, NEW.ip,
+                                                           NEW.action, NEW.result, NEW.details,
+                                                           NEW.prev_hash), 'UTF8')), 'hex');
+    RETURN NEW;
+END $$;
+CREATE TRIGGER audit_log_chain BEFORE INSERT ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_chain();
+
+CREATE FUNCTION audit_log_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log je jen pro zápis (operace % zakázána)', TG_OP;
+END $$;
+CREATE TRIGGER audit_log_no_update BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();
+CREATE TRIGGER audit_log_no_truncate BEFORE TRUNCATE ON audit_log
+    FOR EACH STATEMENT EXECUTE FUNCTION audit_log_immutable();
+
+-- Ověření řetězu: vrací první porušený řádek (nebo nic, když je vše v pořádku).
+CREATE FUNCTION audit_log_verify()
+RETURNS TABLE (seq bigint, problem text) LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    r        record;
+    expected text;
+    prev     text := NULL;
+    prev_seq bigint := NULL;
+BEGIN
+    FOR r IN SELECT * FROM audit_log a ORDER BY a.seq LOOP
+        IF prev IS NOT NULL AND r.prev_hash <> prev THEN
+            seq := r.seq; problem := 'prev_hash nenavazuje na předchozí záznam'; RETURN NEXT; RETURN;
+        END IF;
+        IF prev_seq IS NOT NULL AND r.seq <> prev_seq + 1 THEN
+            seq := r.seq; problem := format('chybí záznamy %s–%s', prev_seq + 1, r.seq - 1); RETURN NEXT; RETURN;
+        END IF;
+        expected := encode(sha256(convert_to(audit_log_payload(r.seq, r.created_at, r.username, r.ip,
+                                                               r.action, r.result, r.details, r.prev_hash),
+                                             'UTF8')), 'hex');
+        IF expected <> r.hash THEN
+            seq := r.seq; problem := 'obsah záznamu neodpovídá hashi (změněno)'; RETURN NEXT; RETURN;
+        END IF;
+        prev := r.hash;
+        prev_seq := r.seq;
+    END LOOP;
+END $$;
 
 -- ---------------------------------------------------------------------
 -- 2. Sběr logů
@@ -421,18 +491,48 @@ END $$;
 SELECT ensure_partitions(2);
 
 -- ---------------------------------------------------------------------
--- 8. Práva (role vytváří instalační skript; zde jen GRANTy)
+-- 8. Práva
 -- ---------------------------------------------------------------------
--- GRANT SELECT ON ALL TABLES IN SCHEMA public TO mailpanel_web;
--- GRANT INSERT, UPDATE, DELETE ON users, login_attempts, ad_servers, ad_role_groups, settings TO mailpanel_web;
--- GRANT INSERT ON audit_log TO mailpanel_web;
--- GRANT INSERT (action, args, requested_by, requested_ip) ON agent_task TO mailpanel_web;   -- web NEMŮŽE měnit status
--- GRANT UPDATE (acknowledged_by, acknowledged_at) ON alert_state TO mailpanel_web;
---
--- GRANT SELECT, INSERT, UPDATE, DELETE ON collector_state, log_line, mail_message, mail_delivery,
---       mail_reject, auth_event, mail_open, stats_hourly, queue_sample, health_check,
---       mailbox_stats, mailbox_size_daily, alert_state TO mailpanel_collector;
---
--- GRANT SELECT ON agent_task TO mailpanel_agent;
--- GRANT UPDATE (status, result, started_at, finished_at) ON agent_task TO mailpanel_agent;
--- GRANT INSERT ON audit_log TO mailpanel_agent;
+-- Role vytváří instalace (docs/INSTALACE.md). Migrace běží jako vlastník
+-- (mailpanel_owner); GRANTy se nastaví jen rolím, které existují.
+-- Logové tabulky jsou pro collector jen INSERT (+ SELECT): co jednou zapíše,
+-- už nezmění ani nesmaže. Retenci (DROP partition) dělá jen vlastník.
+
+ALTER FUNCTION ensure_partitions(int) SECURITY DEFINER;
+REVOKE ALL ON FUNCTION ensure_partitions(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION drop_old_partitions(text, int) FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mailpanel_web') THEN
+        GRANT USAGE ON SCHEMA public TO mailpanel_web;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO mailpanel_web;
+        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO mailpanel_web;
+        GRANT INSERT, UPDATE ON users TO mailpanel_web;
+        GRANT INSERT, DELETE ON login_attempts TO mailpanel_web;
+        GRANT INSERT, UPDATE, DELETE ON login_unlock, settings TO mailpanel_web;
+        GRANT INSERT ON audit_log TO mailpanel_web;
+        GRANT INSERT (action, args, requested_by, requested_ip) ON agent_task TO mailpanel_web;
+        GRANT UPDATE (acknowledged_by, acknowledged_at) ON alert_state TO mailpanel_web;
+        GRANT EXECUTE ON FUNCTION audit_log_verify() TO mailpanel_web;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mailpanel_collector') THEN
+        GRANT USAGE ON SCHEMA public TO mailpanel_collector;
+        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO mailpanel_collector;
+        GRANT SELECT, INSERT ON log_line, mail_reject, auth_event, audit_log TO mailpanel_collector;
+        GRANT SELECT, INSERT, UPDATE ON mail_message, mail_delivery TO mailpanel_collector;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON collector_state, mail_open, stats_hourly, queue_sample,
+              health_check, mailbox_stats, mailbox_size_daily, alert_state TO mailpanel_collector;
+        GRANT SELECT ON settings, users TO mailpanel_collector;
+        GRANT EXECUTE ON FUNCTION ensure_partitions(int) TO mailpanel_collector;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mailpanel_agent') THEN
+        GRANT USAGE ON SCHEMA public TO mailpanel_agent;
+        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO mailpanel_agent;
+        GRANT SELECT ON agent_task, settings TO mailpanel_agent;
+        GRANT UPDATE (status, result, started_at, finished_at) ON agent_task TO mailpanel_agent;
+        GRANT SELECT, INSERT ON audit_log TO mailpanel_agent;
+    END IF;
+END $$;

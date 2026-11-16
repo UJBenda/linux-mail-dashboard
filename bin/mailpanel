@@ -1,0 +1,267 @@
+#!/usr/bin/env php
+<?php
+
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Linux Mail Dashboard – https://github.com/UJBenda/linux-mail-dashboard
+
+declare(strict_types=1);
+
+use MailPanel\Ad\AdClient;
+use MailPanel\Ad\AdException;
+use MailPanel\App;
+use MailPanel\Auth\AuthException;
+use MailPanel\Auth\Roles;
+use MailPanel\Support\ConfigException;
+use MailPanel\Support\Crypto;
+use MailPanel\Support\Migrator;
+
+if (PHP_SAPI !== 'cli') {
+    exit(1);
+}
+$root = dirname(__DIR__);
+require $root . '/src/bootstrap.php';
+
+$argv = $_SERVER['argv'];
+array_shift($argv);
+$cmd = array_shift($argv) ?? 'help';
+$opts = [];
+$args = [];
+foreach ($argv as $a) {
+    if (preg_match('/^--([a-z-]+)(?:=(.*))?$/', $a, $m)) {
+        $opts[$m[1]] = $m[2] ?? '1';
+    } else {
+        $args[] = $a;
+    }
+}
+
+/** Kdo spustil příkaz (do auditu). */
+function cliActor(): string
+{
+    $sudo = getenv('SUDO_USER');
+    $user = function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? 'cli') : (getenv('USER') ?: 'cli');
+    return 'cli:' . ($sudo ? "$sudo(via sudo)" : $user);
+}
+
+function out(string $s = ''): void
+{
+    fwrite(STDOUT, $s . PHP_EOL);
+}
+
+function fail(string $s, int $code = 1): never
+{
+    fwrite(STDERR, $s . PHP_EOL);
+    exit($code);
+}
+
+function askSecret(string $prompt): string
+{
+    fwrite(STDERR, $prompt);
+    $tty = stream_isatty(STDIN);
+    if ($tty) {
+        shell_exec('stty -echo');
+    }
+    $v = rtrim((string) fgets(STDIN), "\r\n");
+    if ($tty) {
+        shell_exec('stty echo');
+        fwrite(STDERR, PHP_EOL);
+    }
+    return $v;
+}
+
+$help = <<<TXT
+Linux Mail Dashboard – správa z příkazové řádky
+
+  check                         kontrola konfigurace, DB, AD a práv souborů
+  key:generate                  vygeneruje secret_key do config.php
+  migrate                       aplikuje databázové migrace (spouštět jako vlastník DB)
+
+  user:list                     uživatelé panelu
+  user:local <jméno> --ips=CIDR,... --roles=admin
+                                nouzový lokální účet (heslo se zadá interaktivně, min. 16 znaků)
+  user:mfa-reset <jméno>        zruší MFA (uživatel si ho nastaví při dalším přihlášení)
+  user:disable <jméno> | user:enable <jméno>
+  login:unlock <jméno>|<IP>     odblokuje uživatele / IP po neúspěšných pokusech
+  login:log [--limit=50]        poslední pokusy o přihlášení
+
+  ad:test [jméno]               test spojení na řadiče; s jménem i přihlášení a role
+  ad:groups <hledaný text>      vyhledá skupiny AD a jejich SID (pro ad.role_groups)
+
+  audit:verify                  ověří integritu auditního záznamu (hash chain)
+  audit:anchor                  zapíše hlavu řetězu do syslogu (authpriv) – spouštět z cronu/timeru
+
+TXT;
+
+try {
+    switch ($cmd) {
+        case 'help':
+        case '--help':
+        case '-h':
+            out($help);
+            exit(0);
+
+        case 'key:generate':
+            out(Crypto::generateKey());
+            out('Vložte do config/config.php jako secret_key. Změna klíče znehodnotí uložená MFA tajemství.');
+            exit(0);
+    }
+
+    $app = App::fromRoot($root);
+    $config = $app->config();
+    $actor = cliActor();
+
+    switch ($cmd) {
+        case 'check':
+            $ok = true;
+            $line = function (bool $good, string $what, string $detail = '') use (&$ok): void {
+                $ok = $ok && $good;
+                out(sprintf('[%s] %s%s', $good ? ' OK ' : 'CHYBA', $what, $detail !== '' ? " – $detail" : ''));
+            };
+            $cfgFile = getenv('MAILPANEL_CONFIG') ?: $root . '/config/config.php';
+            $perms = fileperms($cfgFile) & 0777;
+            $line(($perms & 0007) === 0, 'práva config.php', sprintf('%o%s', $perms, ($perms & 0007) ? ' (nesmí být čitelný pro ostatní, použijte 0640)' : ''));
+            foreach (['pdo_pgsql', 'ldap', 'sodium', 'mbstring'] as $ext) {
+                $line(extension_loaded($ext), "rozšíření PHP $ext");
+            }
+            try {
+                new Crypto($config->string('secret_key'));
+                $line(true, 'secret_key');
+            } catch (ConfigException $e) {
+                $line(false, 'secret_key', $e->getMessage());
+            }
+            try {
+                $app->db()->value('SELECT 1');
+                $line(true, 'připojení k DB');
+                $pending = (new Migrator($app->db(), $root . '/db/migrations'))->pending();
+                $line($pending === [], 'migrace', $pending === [] ? 'aktuální' : 'čeká: ' . implode(', ', $pending) . ' → bin/mailpanel migrate');
+                $admins = (int) $app->db()->value("SELECT count(*) FROM users WHERE is_active AND roles LIKE '%admin%'");
+                out(sprintf('[INFO] aktivních administrátorů v DB: %d', $admins));
+            } catch (Throwable $e) {
+                $line(false, 'připojení k DB', $e->getMessage());
+            }
+            $line($config->bool('session.cookie_secure', true), 'session.cookie_secure', $config->bool('session.cookie_secure', true) ? '' : 'vypnuto – jen pro test bez HTTPS');
+            $roleGroups = $config->array('ad.role_groups');
+            $line(!empty($roleGroups['admin']), 'ad.role_groups.admin', empty($roleGroups['admin']) ? 'není nastavena skupina pro administrátory' : '');
+            $ad = $app->directory();
+            if ($ad instanceof AdClient && $ad->isConfigured()) {
+                foreach ($ad->testServers() as $r) {
+                    $line($r['ok'], 'AD ' . $r['server'], $r['message'] . " ({$r['ms']} ms)");
+                }
+            } else {
+                $line(false, 'AD', 'není nakonfigurováno (ad.servers, base_dn, bind_dn, bind_password)');
+            }
+            $sync = trim((string) @shell_exec('timedatectl show -p NTPSynchronized --value 2>/dev/null'));
+            if ($sync !== '') {
+                $line($sync === 'yes', 'synchronizace času (NTP)', $sync === 'yes' ? '' : 'čas není synchronizován – časové značky logů nejsou spolehlivé');
+            }
+            exit($ok ? 0 : 1);
+
+        case 'migrate':
+            $applied = (new Migrator($app->db(), $root . '/db/migrations'))->migrate();
+            out($applied === [] ? 'Žádné nové migrace.' : 'Aplikováno: ' . implode(', ', $applied));
+            if ($applied !== []) {
+                $app->audit()->log('system.migrate', ['applied' => $applied], 'ok', $actor);
+            }
+            exit(0);
+
+        case 'user:list':
+            foreach ($app->db()->all('SELECT * FROM users ORDER BY username') as $u) {
+                out(sprintf('%-20s %-5s %-8s MFA:%-3s %-28s %s', $u['username'], $u['source'], $u['is_active'] ? 'aktivní' : 'ZAKÁZÁN',
+                    $u['mfa_enrolled_at'] ? 'ano' : 'ne', $u['roles'] ?: '-', $u['last_login_at'] ?? 'nepřihlášen'));
+            }
+            exit(0);
+
+        case 'user:local':
+            $name = $args[0] ?? fail('Použití: user:local <jméno> --ips=10.0.0.0/24 --roles=admin');
+            $pass = askSecret('Heslo (min. 16 znaků): ');
+            if ($pass !== askSecret('Heslo znovu: ')) {
+                fail('Hesla se neshodují.');
+            }
+            $app->authenticator()->setLocalUser($name, $pass, $opts['ips'] ?? '', $opts['roles'] ?? Roles::ADMIN, $actor);
+            out("Nouzový účet $name uložen. Při prvním přihlášení si nastaví MFA.");
+            exit(0);
+
+        case 'user:mfa-reset':
+        case 'user:disable':
+        case 'user:enable':
+            $name = strtolower($args[0] ?? fail("Použití: $cmd <jméno>"));
+            $u = $app->db()->one('SELECT id FROM users WHERE username = ?', [$name]) ?? fail("Uživatel $name neexistuje.");
+            if ($cmd === 'user:mfa-reset') {
+                $app->authenticator()->resetMfa((int) $u['id'], $actor);
+                out("MFA uživatele $name zrušeno.");
+            } else {
+                $active = $cmd === 'user:enable';
+                $app->db()->update('users', ['is_active' => $active], ['id' => $u['id']]);
+                $app->audit()->log($active ? 'user.enabled' : 'user.disabled', ['user' => $name], 'ok', $actor);
+                out("Uživatel $name " . ($active ? 'povolen.' : 'zakázán.'));
+            }
+            exit(0);
+
+        case 'login:unlock':
+            $who = $args[0] ?? fail('Použití: login:unlock <jméno>|<IP>');
+            $subject = filter_var($who, FILTER_VALIDATE_IP) !== false ? "ip:$who" : 'user:' . \MailPanel\Auth\Authenticator::throttleKey($who);
+            $app->authenticator()->unlock($subject, $actor);
+            out("Odblokováno: $subject");
+            exit(0);
+
+        case 'login:log':
+            $limit = max(1, min(1000, (int) ($opts['limit'] ?? 50)));
+            foreach (array_reverse($app->db()->all('SELECT * FROM login_attempts ORDER BY id DESC LIMIT ' . $limit)) as $r) {
+                out(sprintf('%s  %-20s %-39s %-8s %s', $r['created_at'], $r['username'], $r['ip'], $r['stage'], $r['success'] ? 'OK' : 'NEÚSPĚCH'));
+            }
+            out('Důvody neúspěchů: portál → Audit, akce auth.password (pole reason).');
+            exit(0);
+
+        case 'ad:test':
+            $ad = $app->directory();
+            if (!$ad instanceof AdClient || !$ad->isConfigured()) {
+                fail('AD není nakonfigurováno v config.php (sekce ad).');
+            }
+            foreach ($ad->testServers() as $r) {
+                out(sprintf('[%s] %s – %s (%d ms)', $r['ok'] ? ' OK ' : 'CHYBA', $r['server'], $r['message'], $r['ms']));
+            }
+            if (isset($args[0])) {
+                $du = $ad->authenticate($args[0], askSecret("Heslo pro {$args[0]}: "));
+                out("DN:       {$du->dn}");
+                out("Jméno:    {$du->username} ({$du->displayName})");
+                out('E-mail:   ' . ($du->email ?? '-'));
+                out('Skupin:   ' . count($du->groupSids));
+                $roles = Roles::fromSids($du->groupSids, $config->array('ad.role_groups'));
+                out('Role:     ' . ($roles === [] ? 'ŽÁDNÁ – uživatel se do panelu nepřihlásí' : implode(', ', $roles)));
+            }
+            exit(0);
+
+        case 'ad:groups':
+            $ad = $app->directory();
+            if (!$ad instanceof AdClient) {
+                fail('AD není k dispozici.');
+            }
+            $q = $args[0] ?? fail('Použití: ad:groups <hledaný text>');
+            foreach ($ad->searchGroups($q) as $g) {
+                out(sprintf("%-40s %s\n    %s", $g['name'], $g['sid'], $g['dn']));
+            }
+            exit(0);
+
+        case 'audit:verify':
+            $v = $app->audit()->verify();
+            $app->audit()->log('audit.verify', ['ok' => $v['ok'], 'seq' => $v['seq']], $v['ok'] ? 'ok' : 'fail', $actor);
+            if ($v['ok']) {
+                out("Integrita v pořádku, záznamů: {$v['count']}, hlava: {$v['head']}");
+                exit(0);
+            }
+            fail("INTEGRITA PORUŠENA u záznamu {$v['seq']}: {$v['problem']}", 2);
+
+        case 'audit:anchor':
+            $msg = $app->audit()->anchor();
+            out($msg ?? 'Audit je prázdný.');
+            exit(0);
+
+        default:
+            fail("Neznámý příkaz $cmd\n\n$help");
+    }
+} catch (ConfigException $e) {
+    fail('Konfigurace: ' . $e->getMessage());
+} catch (AuthException $e) {
+    fail($e->getMessage());
+} catch (AdException $e) {
+    fail('AD: ' . $e->getMessage());
+}
