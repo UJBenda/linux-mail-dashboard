@@ -53,3 +53,16 @@ var/               běhová data (certifikáty AD, zámky) – není v gitu
 ## Dokumentace
 
 - [Návrh řešení](docs/NAVRH.md)
+
+## Licence
+
+[MIT s doložkou Commons Clause](LICENSE). Zjednodušeně (závazné je znění v souboru `LICENSE`):
+
+- **Smíte:** používat zdarma, i ve firmě pro vlastní mail server; upravovat; šířit původní i upravené verze.
+- **Musíte:** zachovat informaci o autorovi a text licence (včetně doložky Commons Clause) ve všech kopiích
+  a odvozených dílech.
+- **Nesmíte:** software prodávat – ani jako produkt, ani jako placený hosting nebo placenou podporu,
+  jejichž hodnota stojí hlavně na tomto softwaru.
+
+Kvůli zákazu prodeje nejde o open source licenci podle definice OSI, ale o licenci se zveřejněným zdrojovým
+kódem (*source-available*).
